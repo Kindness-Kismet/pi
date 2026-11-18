@@ -1,118 +1,130 @@
-// Compile extensions in the binary and validate artifacts against file stamps and compiler versions.
-import { build, Transpiler } from "bun";
-import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { isBuiltin } from "node:module";
-import { dirname, extname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
-import type { Jiti } from "jiti";
-import jitiMetadata from "jiti/package.json";
-import { VERSION } from "../../src/config.ts";
+// Cache transformed extension bundles by content and compiler policy.
 
-interface InputStamp {
-	filename: string;
-	mtimeMs: number;
-	size: number;
-}
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { build, spawn } from "bun";
+import type { Jiti } from "jiti";
+import jitiMetadata from "jiti/package.json" with { type: "json" };
+import { type BundleRequest, type BundleResult, type Observation, readObservation } from "./extension-observations.ts";
+
+const compilerBuild = await build({
+	entrypoints: [fileURLToPath(new URL("./extension-bundle.ts", import.meta.url))],
+	target: "bun",
+	format: "esm",
+	minify: true,
+});
+const compilerSource = await compilerBuild.outputs[0].text();
+const version = `precompile-8:${process.versions.bun}:${jitiMetadata.version}:${hash(compilerSource)}`;
 
 interface Artifact {
 	version: string;
-	inputs: InputStamp[];
-	directories: Array<{ filename: string; mtimeMs: number }>;
+	policy: string;
+	external: string[];
+	observations: Observation[];
+	bundleHash: string;
+	codeHash: string;
 	code: string;
 }
 
-const version = `precompile-6:${VERSION}:${jitiMetadata.version}:${process.versions.bun}`;
-
-/** Compile an extension without executing its factory, reusing a valid artifact. */
+/** Reuse valid transformed code without executing extension factories. */
 export async function prepareCompiledExtension(
 	filename: string,
 	virtualModules: Record<string, unknown>,
 	jiti: Jiti,
 	cacheDirectory: string,
 ): Promise<string | undefined> {
-	mkdirSync(cacheDirectory, { recursive: true });
-	const key = createHash("sha256").update(filename).digest("hex");
-	const cachedFile = join(cacheDirectory, key + ".json");
+	// Separate compiler generations so another installed binary cannot replace this cache.
+	const generationDirectory = join(cacheDirectory, hash(version));
+	mkdirSync(generationDirectory, { recursive: true });
+	const cachedFile = join(generationDirectory, `${hash(filename)}.json`);
+	const external = Object.keys(virtualModules).sort();
+	const policy = JSON.stringify({
+		transformOptions: jiti.options.transformOptions,
+		jsx: jiti.options.jsx,
+		interopDefault: jiti.options.interopDefault,
+		sourceMaps: jiti.options.sourceMaps,
+	});
+	let cached: Artifact | undefined;
 	try {
-		const cached = JSON.parse(readFileSync(cachedFile, "utf8")) as Artifact;
+		// The version and code digest gate the persisted cache trust boundary.
+		const artifact = JSON.parse(readFileSync(cachedFile, "utf8")) as Partial<Artifact> | null;
 		if (
-			cached.version === version &&
-			cached.inputs.every((input) => {
-				const stat = statSync(input.filename);
-				return stat.mtimeMs === input.mtimeMs && stat.size === input.size;
-			}) &&
-			cached.directories.every((directory) => statSync(directory.filename).mtimeMs === directory.mtimeMs)
+			artifact?.version === version &&
+			typeof artifact.code === "string" &&
+			artifact.codeHash === hash(artifact.code) &&
+			typeof artifact.policy === "string" &&
+			typeof artifact.bundleHash === "string" &&
+			Array.isArray(artifact.external) &&
+			artifact.external.every((specifier) => typeof specifier === "string") &&
+			Array.isArray(artifact.observations) &&
+			artifact.observations.every(
+				(observation) =>
+					observation !== null &&
+					typeof observation === "object" &&
+					["input", "package", "directory", "config"].includes(observation.kind) &&
+					typeof observation.filename === "string" &&
+					typeof observation.value === "string",
+			)
 		) {
-			return cached.code;
+			// All persisted fields used below have passed the cache schema boundary.
+			cached = artifact as Artifact;
+			if (
+				cached.policy === policy &&
+				JSON.stringify(cached.external) === JSON.stringify(external) &&
+				cached.observations.every((observation) => readObservation(observation) === observation.value)
+			)
+				return cached.code;
 		}
 	} catch (error) {
 		if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 
-	const inputs = new Map<string, InputStamp>();
-	const directories = new Map<string, number>();
-	const addInput = (path: string) => {
-		if (inputs.has(path)) return;
-		const stat = statSync(path);
-		inputs.set(path, { filename: path, mtimeMs: stat.mtimeMs, size: stat.size });
-	};
-	const result = await build({
-		entrypoints: [filename], target: "node", format: "esm", minify: true, throw: false,
-		plugins: [{ name: "extension-paths", setup(builder) {
-			builder.onResolve({ filter: /.*/ }, (args) => {
-				if (isBuiltin(args.path) || args.path in virtualModules) {
-					return { path: args.path, external: true };
-				}
-				if (args.path.endsWith(".node")) {
-					const filename = resolve(args.resolveDir, args.path);
-					addInput(filename);
-					return { path: filename, external: true };
-				}
-			});
-			builder.onLoad({ filter: /\.[cm]?[jt]sx?$/ }, async (args) => {
-				const path = resolve(args.path);
-				addInput(path);
-				let current = dirname(path);
-				while (current !== dirname(current)) {
-					if (directories.has(current)) break;
-					// Directory stamps detect new files that change resolution precedence.
-					directories.set(current, statSync(current).mtimeMs);
-					for (const name of ["package.json", "tsconfig.json"]) {
-						try { addInput(join(current, name)); }
-						catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-					}
-					current = dirname(current);
-				}
-				const extension = extname(path);
-				const loader = extension === ".tsx" ? "tsx" : extension === ".jsx" ? "jsx" : /\.[cm]?ts$/.test(path) ? "ts" : "js";
-				const transpiler = new Transpiler({ loader, trimUnusedImports: true, define: {
-					"import.meta.url": JSON.stringify(pathToFileURL(path).href),
-					"import.meta.dirname": JSON.stringify(dirname(path)),
-					"import.meta.filename": JSON.stringify(path),
-					__dirname: JSON.stringify(dirname(path)),
-					__filename: JSON.stringify(path),
-				} });
-				return { contents: transpiler.transformSync(readFileSync(path, "utf8")), loader: "js" };
-			});
-			builder.onLoad({ filter: /\.json$/ }, (args) => {
-				addInput(resolve(args.path));
-				return { contents: readFileSync(args.path, "utf8"), loader: "json" };
-			});
-		} }],
+	// Bun's resolver cache is shared across builds and Workers; a process owns a fresh resolver.
+	const child = spawn([process.execPath, "--eval", compilerSource], {
+		env: { ...process.env, BUN_BE_BUN: "1" },
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
 	});
-	if (!result.success) {
-		return undefined;
-	}
-	const output = await result.outputs[0].text();
-	const code = jiti.transform({ source: output, filename, async: true, ts: false });
+	const request: BundleRequest = { filename, external };
+	child.stdin.write(JSON.stringify(request));
+	child.stdin.end();
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	if (exitCode !== 0) throw new Error(`Extension compiler exited with code ${exitCode}: ${stderr.trim()}`);
+	const result = JSON.parse(stdout) as BundleResult;
+	if (result.status === "failed") return undefined;
+	const bundleHash = hash(result.source);
+	const code =
+		cached?.policy === policy && cached.bundleHash === bundleHash
+			? cached.code
+			: jiti.transform({
+					source: result.source,
+					filename,
+					async: true,
+					ts: false,
+				});
 	const artifact: Artifact = {
-		version, inputs: [...inputs.values()],
-		directories: [...directories].map(([filename, mtimeMs]) => ({ filename, mtimeMs })),
+		version,
+		policy,
+		external,
+		observations: result.observations,
+		bundleHash,
+		codeHash: hash(code),
 		code,
 	};
-	const temporary = cachedFile + `.${process.pid}.tmp`;
+	const temporary = `${cachedFile}.${process.pid}.${randomUUID()}.tmp`;
 	writeFileSync(temporary, JSON.stringify(artifact));
 	renameSync(temporary, cachedFile);
 	return code;
+}
+
+function hash(value: string): string {
+	return createHash("sha256").update(value).digest("hex");
 }

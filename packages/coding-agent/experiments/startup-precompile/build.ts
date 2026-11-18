@@ -1,9 +1,10 @@
-// Build the current branch's experimental binary with automatic extension precompilation.
-import { build } from "bun";
+// Build the official Bun entry with content-validated extension precompilation.
+
 import { createHash } from "node:crypto";
 import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { build } from "bun";
 
 const root = fileURLToPath(new URL("../../../../", import.meta.url));
 const packageRoot = join(root, "packages/coding-agent");
@@ -13,9 +14,16 @@ const output = join(root, "build/startup-precompile/binaries");
 await mkdir(output, { recursive: true });
 const outfile = join(output, "pi-precompiled.exe");
 const compilerPath = fileURLToPath(new URL("./extension-cache.ts", import.meta.url));
+const compilerBuild = await build({
+	entrypoints: [fileURLToPath(new URL("./extension-bundle.ts", import.meta.url))],
+	target: "bun",
+	format: "esm",
+	minify: true,
+});
+const compilerSource = await compilerBuild.outputs[0].text();
 const result = await build({
 	entrypoints: [
-		join(packageRoot, "src/cli.ts"),
+		join(packageRoot, "src/bun/cli.ts"),
 		join(packageRoot, "src/utils/image-resize-worker.ts"),
 		join(packageRoot, "src/extensions/codemode/worker.ts"),
 	],
@@ -29,28 +37,47 @@ const result = await build({
 		autoloadBunfig: false,
 		autoloadPackageJson: true,
 	},
-	plugins: [{
-		name: "startup-precompile",
-		setup(builder) {
-			builder.onLoad({ filter: /[\\/]core[\\/]extensions[\\/]loader\.ts$/ }, async (args) => {
-				let source = await readFile(args.path, "utf8");
-				source = `import { prepareCompiledExtension } from ${JSON.stringify(compilerPath)};\n` + source;
-				source = source.replace(
-					"const jiti = createJitiImpl(import.meta.url, {",
-					'const compilerJiti = createJitiImpl(import.meta.url, { moduleCache: false, fsCache: false, ...resolutionOptions });\n\tconst compiled = await prepareCompiledExtension(canonicalizePath(extensionPath), resolutionOptions.virtualModules ?? {}, compilerJiti, path.join(getAgentDir(), "cache", "extensions-prototype"));\n\tconst jiti = createJitiImpl(import.meta.url, {',
-				);
-				source = source.replace(
-					"moduleCache: false,\n\t\t...resolutionOptions,",
-					"moduleCache: false,\n\t\t...resolutionOptions,\n\t\t...(compiled ? { fsCache: false, transform: (options: { source: string }) => ({ code: options.source }) } : {}),",
-				);
-				source = source.replace(
-					'const module = await jiti.import(canonicalizePath(extensionPath), { default: true });',
-					'const loadedModule = compiled ? await jiti.evalModule(compiled, { filename: canonicalizePath(extensionPath), ext: ".cjs", async: true, forceTranspile: true }) : await jiti.import(canonicalizePath(extensionPath), { default: true });\n\tconst module = (loadedModule as { default?: unknown } | undefined)?.default ?? loadedModule;',
-				);
-				if (!source.includes("const compiled = await prepareCompiledExtension(") || !source.includes("const loadedModule = compiled ?")) {
-					throw new Error("Extension loader structure changed; update the experimental build injection points");
-				}
-				source += `
+	plugins: [
+		{
+			name: "startup-precompile",
+			setup(builder) {
+				builder.onLoad({ filter: /[\\/]startup-precompile[\\/]extension-cache\.ts$/ }, async (args) => {
+					let source = await readFile(args.path, "utf8");
+					const start = source.indexOf("const compilerBuild =");
+					const end = source.indexOf("\nconst version =", start);
+					if (start < 0 || end < 0) throw new Error("Extension compiler structure changed");
+					source =
+						source.slice(0, start) +
+						`const compilerSource = ${JSON.stringify(compilerSource)};` +
+						source.slice(end);
+					return {
+						contents: source,
+						loader: "ts",
+						resolveDir: dirname(args.path),
+					};
+				});
+				builder.onLoad({ filter: /[\\/]core[\\/]extensions[\\/]loader\.ts$/ }, async (args) => {
+					let source = await readFile(args.path, "utf8");
+					source = `import { prepareCompiledExtension } from ${JSON.stringify(compilerPath)};\n${source}`;
+					source = source.replace(
+						"const jiti = createJitiImpl(import.meta.url, {",
+						'const compilerJiti = createJitiImpl(import.meta.url, { moduleCache: false, fsCache: false, ...resolutionOptions });\n\tconst compiled = await prepareCompiledExtension(canonicalizePath(extensionPath), resolutionOptions.virtualModules ?? {}, compilerJiti, path.join(getAgentDir(), "cache", "extensions-prototype"));\n\tconst jiti = createJitiImpl(import.meta.url, {',
+					);
+					source = source.replace(
+						"moduleCache: false,\n\t\t...resolutionOptions,",
+						"moduleCache: false,\n\t\t...resolutionOptions,\n\t\t...(compiled ? { fsCache: false, transform: (options: { source: string }) => ({ code: options.source }) } : {}),",
+					);
+					source = source.replace(
+						"const module = await jiti.import(canonicalizePath(extensionPath), { default: true });",
+						'const loadedModule = compiled ? await jiti.evalModule(compiled, { filename: canonicalizePath(extensionPath), ext: ".cjs", async: true, forceTranspile: true }) : await jiti.import(canonicalizePath(extensionPath), { default: true });\n\tconst module = (loadedModule as { default?: unknown } | undefined)?.default ?? loadedModule;',
+					);
+					if (
+						!source.includes("const compiled = await prepareCompiledExtension(") ||
+						!source.includes("const loadedModule = compiled ?")
+					) {
+						throw new Error("Extension loader structure changed; update the experimental build injection points");
+					}
+					source += `
 /** Precompile installed entries without executing extension factories. */
 export async function precompileInstalledExtensions(paths: Array<string | undefined>): Promise<void> {
 	const pending = paths.filter((filename): filename is string => filename !== undefined);
@@ -72,28 +99,53 @@ export async function precompileInstalledExtensions(paths: Array<string | undefi
 	for (const filename of files) await prepareCompiledExtension(filename, virtualModules, compiler, path.join(getAgentDir(), "cache", "extensions-prototype"));
 }
 `;
-				return { contents: source, loader: "ts", resolveDir: dirname(args.path) };
-			});
-			builder.onLoad({ filter: /[\\/]core[\\/]package-manager\.ts$/ }, async (args) => {
-				let source = await readFile(args.path, "utf8");
-				source = 'import { precompileInstalledExtensions } from "./extensions/loader.ts";\n' + source;
-				const installEnd = '\t\t\tthrow new Error(`Unsupported install source: ${source}`);\n\t\t});\n\t}';
-				if (!source.includes(installEnd)) throw new Error("Package installer structure changed");
-				source = source.replace(installEnd, '\t\t\tthrow new Error(`Unsupported install source: ${source}`);\n\t\t});\n\t\tawait precompileInstalledExtensions([this.getInstalledPath(source, scope)]);\n\t}');
-				const updateEnd = '\t\tawait this.updateConfiguredSources(updateSources);';
-				if (!source.includes(updateEnd)) throw new Error("Package updater structure changed");
-				source = source.replace(updateEnd, updateEnd + '\n\t\tawait precompileInstalledExtensions(updateSources.map(entry => this.getInstalledPath(entry.source, entry.scope)));');
-				return { contents: source, loader: "ts", resolveDir: dirname(args.path) };
-			});
+					return {
+						contents: source,
+						loader: "ts",
+						resolveDir: dirname(args.path),
+					};
+				});
+				builder.onLoad({ filter: /[\\/]core[\\/]package-manager\.ts$/ }, async (args) => {
+					let source = await readFile(args.path, "utf8");
+					source = `import { precompileInstalledExtensions } from "./extensions/loader.ts";\n${source}`;
+					const installEnd =
+						// biome-ignore lint/suspicious/noTemplateCurlyInString: Match the source's literal placeholder.
+						"\t\t\tthrow new Error(`Unsupported install source: ${source}`);\n\t\t});\n\t}";
+					if (!source.includes(installEnd)) throw new Error("Package installer structure changed");
+					source = source.replace(
+						installEnd,
+						// biome-ignore lint/suspicious/noTemplateCurlyInString: Preserve the source's literal placeholder.
+						"\t\t\tthrow new Error(`Unsupported install source: ${source}`);\n\t\t});\n\t\tawait precompileInstalledExtensions([this.getInstalledPath(source, scope)]);\n\t}",
+					);
+					const updateEnd = "\t\tawait this.updateConfiguredSources(updateSources);";
+					if (!source.includes(updateEnd)) throw new Error("Package updater structure changed");
+					source = source.replace(
+						updateEnd,
+						updateEnd +
+							"\n\t\tawait precompileInstalledExtensions(updateSources.map(entry => this.getInstalledPath(entry.source, entry.scope)));",
+					);
+					return {
+						contents: source,
+						loader: "ts",
+						resolveDir: dirname(args.path),
+					};
+				});
+			},
 		},
-	}],
+	],
 });
 if (!result.success) throw new AggregateError(result.logs, "Experimental binary build failed");
 for (const name of ["assets", "theme", "export-html", "native", "photon_rs_bg.wasm", "README.md"]) {
-	await cp(join(resolve(assetDirectory), name), join(output, name), { recursive: true });
+	await cp(join(resolve(assetDirectory), name), join(output, name), {
+		recursive: true,
+	});
 }
 await cp(join(packageRoot, "package.json"), join(output, "package.json"));
 const binary = await readFile(outfile);
-const manifest = { outfile, bytes: binary.length, sha256: createHash("sha256").update(binary).digest("hex") };
-await writeFile(join(output, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
+const manifest = {
+	outfile,
+	bytes: binary.length,
+	sha256: createHash("sha256").update(binary).digest("hex"),
+};
+await writeFile(join(output, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 console.log(JSON.stringify(manifest));
