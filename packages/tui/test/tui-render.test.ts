@@ -216,7 +216,7 @@ describe("TUI bounded render output", () => {
 		);
 		assert.strictEqual(
 			terminal.writes.join(""),
-			`\x1b[?2026h${kittyLine}\r\n${kittyLine}\x1b[?2026l`,
+			`\x1b[?2026h\x1b[?7l${kittyLine}\r\n${kittyLine}\x1b[?25l\x1b[?7h\x1b[?2026l`,
 			"chunking must preserve the synchronized render output",
 		);
 	});
@@ -1048,7 +1048,8 @@ describe("TUI fake cursor", () => {
 		tui.start();
 		await terminal.waitForRender();
 		assert.ok(!terminal.getWrites().includes("\x1b[7m"));
-		assert.ok(terminal.getWrites().endsWith("\x1b[3G"));
+		assert.deepStrictEqual(terminal.getCursorPosition(), { x: 2, y: 0 });
+		assert.ok(terminal.getWrites().endsWith("\x1b[?7h\x1b[?2026l"));
 		tui.stop();
 	});
 
@@ -1069,7 +1070,8 @@ describe("TUI fake cursor", () => {
 			assert.ok(writes.includes("XXX"));
 			assert.strictEqual(writes.includes("\x1b[7md"), !showHardwareCursor);
 			// The hardware cursor is positioned at column 4 in both modes
-			assert.ok(writes.endsWith("\x1b[4G"));
+			assert.deepStrictEqual(terminal.getCursorPosition(), { x: 3, y: 0 });
+			assert.ok(writes.endsWith("\x1b[?7h\x1b[?2026l"));
 			tui.stop();
 		}
 	});
