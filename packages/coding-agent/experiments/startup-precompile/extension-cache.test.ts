@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti/static";
 import { prepareCompiledExtension } from "./extension-cache.ts";
+import { changeInstallation } from "./installed-extensions.ts";
 
 const fixtureRoot = fileURLToPath(new URL("../../../../build/cold-start/cache-tests/", import.meta.url));
 mkdirSync(fixtureRoot, { recursive: true });
@@ -37,10 +38,10 @@ function createFixture(source = 'export default () => "first";') {
 		return transform(options);
 	};
 	const cache = join(agent, "cache");
-	const compile = (virtualModules: Record<string, unknown> = {}) =>
-		prepareCompiledExtension(entry, virtualModules, compiler, cache);
-	const evaluate = async (virtualModules: Record<string, unknown> = {}) => {
-		const code = await compile(virtualModules);
+	const compile = (virtualModules: Record<string, unknown> = {}, installRoot?: string) =>
+		prepareCompiledExtension(entry, virtualModules, compiler, cache, installRoot);
+	const evaluate = async (virtualModules: Record<string, unknown> = {}, installRoot?: string) => {
+		const code = await compile(virtualModules, installRoot);
 		expect(code).toBeDefined();
 		if (code === undefined) throw new Error("The fixture extension failed to compile");
 		const loader = createJiti(import.meta.url, {
@@ -79,6 +80,64 @@ function writePackage(base: string, name: string, value: string, main = "index.j
 }
 
 describe("extension precompile cache", () => {
+	test("loads the installed bundle until the package manager changes its shared installation", async () => {
+		const fixture = createFixture('import value from "./dep"; export default () => value;');
+		const dep = join(fixture.extensions, "dep.ts");
+		writeFileSync(dep, 'export default "installed";');
+		// The test tree inherits the repository tsconfig, so include it in the simulated install.
+		const root = fileURLToPath(new URL("../../../../", import.meta.url));
+		const installed = () => fixture.evaluate({}, root);
+		expect(await installed()).toBe("installed");
+		writeFileSync(dep, 'export default "edited";');
+		expect(await installed()).toBe("installed");
+		expect(await fixture.evaluate()).toBe("edited");
+		await changeInstallation(fixture.cache, root, async () => {
+			writeFileSync(dep, 'export default "updated";');
+		});
+		expect(await installed()).toBe("updated");
+	});
+
+	test("keeps dependencies outside the installed tree live", async () => {
+		const fixture = createFixture('import value from "../workspace"; export default () => value;');
+		const dep = join(fixture.agent, "workspace.ts");
+		writeFileSync(dep, 'export default "first";');
+		expect(await fixture.evaluate({}, fixture.extensions)).toBe("first");
+		writeFileSync(dep, 'export default "second";');
+		expect(await fixture.evaluate({}, fixture.extensions)).toBe("second");
+	});
+
+	test("loads runtime assets relative to the original extension after precompilation", async () => {
+		const fixture = createFixture(
+			'import {readFileSync} from "node:fs"; export default () => readFileSync(new URL("./template.txt", import.meta.url), "utf8");',
+		);
+		const asset = join(fixture.extensions, "template.txt");
+		const root = fileURLToPath(new URL("../../../../", import.meta.url));
+		writeFileSync(asset, "original template");
+		expect(await fixture.evaluate({}, root)).toBe("original template");
+		writeFileSync(asset, "new template");
+		expect(await fixture.evaluate({}, root)).toBe("new template");
+		expect(fixture.compilations()).toBe(1);
+	});
+
+	test("keeps a partially updated installation live until the next successful operation", async () => {
+		const fixture = createFixture();
+		const root = fileURLToPath(new URL("../../../../", import.meta.url));
+		const load = () => fixture.evaluate({}, root);
+		expect(await load()).toBe("first");
+		await expect(
+			changeInstallation(fixture.cache, root, async () => {
+				writeFileSync(fixture.entry, 'export default () => "partial";');
+				throw new Error("Install failed");
+			}),
+		).rejects.toThrow("Install failed");
+		expect(await load()).toBe("partial");
+		writeFileSync(fixture.entry, 'export default () => "changed";');
+		expect(await load()).toBe("changed");
+		await changeInstallation(fixture.cache, root, async () => {});
+		expect(await load()).toBe("changed");
+		writeFileSync(fixture.entry, 'export default () => "edited";');
+		expect(await load()).toBe("changed");
+	});
 	test("reuses code when ancestor runtime state changes", async () => {
 		const fixture = createFixture();
 		expect(await fixture.evaluate()).toBe("first");

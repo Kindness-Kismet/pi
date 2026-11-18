@@ -1,13 +1,16 @@
 // Cache transformed extension bundles by content and compiler policy.
 
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { readFile, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build, spawn } from "bun";
 import type { Jiti } from "jiti";
 import jitiMetadata from "jiti/package.json" with { type: "json" };
+import { time } from "../../src/core/timings.ts";
 import { type BundleRequest, type BundleResult, type Observation, readObservation } from "./extension-observations.ts";
+import { installEpoch, isPackagedBundle } from "./installed-extensions.ts";
 
 const compilerBuild = await build({
 	entrypoints: [fileURLToPath(new URL("./extension-bundle.ts", import.meta.url))],
@@ -34,11 +37,13 @@ export async function prepareCompiledExtension(
 	virtualModules: Record<string, unknown>,
 	jiti: Jiti,
 	cacheDirectory: string,
+	installRoot?: string,
 ): Promise<string | undefined> {
 	// Separate compiler generations so another installed binary cannot replace this cache.
 	const generationDirectory = join(cacheDirectory, hash(version));
 	mkdirSync(generationDirectory, { recursive: true });
 	const cachedFile = join(generationDirectory, `${hash(filename)}.json`);
+	time(`${filename} prepare cache`, "extensions");
 	const external = Object.keys(virtualModules).sort();
 	const policy = JSON.stringify({
 		transformOptions: jiti.options.transformOptions,
@@ -46,6 +51,39 @@ export async function prepareCompiledExtension(
 		interopDefault: jiti.options.interopDefault,
 		sourceMaps: jiti.options.sourceMaps,
 	});
+	const epoch = installRoot && installEpoch(cacheDirectory, installRoot);
+	const installedFile =
+		installRoot && epoch && !epoch.startsWith("changing:")
+			? join(
+					generationDirectory,
+					`${hash(JSON.stringify(["installed-v2", filename, installRoot, policy, external]))}.installed`,
+				)
+			: undefined;
+	if (installedFile) {
+		try {
+			const snapshot = JSON.parse(readFileSync(installedFile, "utf8"));
+			if (
+				snapshot?.epoch === epoch &&
+				typeof snapshot.code === "string" &&
+				snapshot.digest === hash(snapshot.code)
+			) {
+				time(`${filename} load installed bundle`, "extensions");
+				return snapshot.code;
+			}
+		} catch (error) {
+			if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
+	const saveInstalled = (artifact: Artifact) => {
+		if (
+			installedFile &&
+			installRoot &&
+			isPackagedBundle(artifact.observations, installRoot) &&
+			installEpoch(cacheDirectory, installRoot) === epoch
+		) {
+			writeArtifact(installedFile, { epoch, digest: artifact.codeHash, code: artifact.code });
+		}
+	};
 	let cached: Artifact | undefined;
 	try {
 		// The version and code digest gate the persisted cache trust boundary.
@@ -73,15 +111,19 @@ export async function prepareCompiledExtension(
 			if (
 				cached.policy === policy &&
 				JSON.stringify(cached.external) === JSON.stringify(external) &&
-				cached.observations.every((observation) => readObservation(observation) === observation.value)
-			)
+				(await observationsMatch(cached.observations))
+			) {
+				time(`${filename} validate cache (hit)`, "extensions");
+				saveInstalled(cached);
 				return cached.code;
+			}
 		}
 	} catch (error) {
 		if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 
 	// Bun's resolver cache is shared across builds and Workers; a process owns a fresh resolver.
+	time(`${filename} validate cache (miss)`, "extensions");
 	const child = spawn([process.execPath, "--eval", compilerSource], {
 		env: { ...process.env, BUN_BE_BUN: "1" },
 		stdin: "pipe",
@@ -99,6 +141,7 @@ export async function prepareCompiledExtension(
 	]);
 	if (exitCode !== 0) throw new Error(`Extension compiler exited with code ${exitCode}: ${stderr.trim()}`);
 	const result = JSON.parse(stdout) as BundleResult;
+	time(`${filename} rebuild bundle`, "extensions");
 	if (result.status === "failed") return undefined;
 	const bundleHash = hash(result.source);
 	const code =
@@ -119,12 +162,59 @@ export async function prepareCompiledExtension(
 		codeHash: hash(code),
 		code,
 	};
-	const temporary = `${cachedFile}.${process.pid}.${randomUUID()}.tmp`;
-	writeFileSync(temporary, JSON.stringify(artifact));
-	renameSync(temporary, cachedFile);
+	writeArtifact(cachedFile, artifact);
+	saveInstalled(artifact);
+	time(`${filename} transform and store cache`, "extensions");
 	return code;
 }
 
-function hash(value: string): string {
+function writeArtifact(filename: string, artifact: object): void {
+	const temporary = `${filename}.${randomUUID()}.tmp`;
+	writeFileSync(temporary, JSON.stringify(artifact));
+	renameSync(temporary, filename);
+}
+
+async function observationsMatch(observations: Observation[]): Promise<boolean> {
+	const inputs: Observation[] = [];
+	for (const observation of observations) {
+		if (observation.kind === "input") {
+			inputs.push(observation);
+			continue;
+		}
+		if (observation.value === "missing") {
+			try {
+				const stat = statSync(observation.filename, { throwIfNoEntry: false });
+				if (!stat || (observation.kind === "directory" && !stat.isDirectory())) continue;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOTDIR") continue;
+				throw error;
+			}
+		}
+		if (readObservation(observation) !== observation.value) return false;
+	}
+
+	// Overlap cold disk reads while bounding open files and memory on large extensions.
+	let next = 0;
+	let matching = true;
+	async function checkInputs(): Promise<void> {
+		while (matching && next < inputs.length) {
+			const { filename, value } = inputs[next++];
+			try {
+				const resolved = await realpath(filename);
+				if (!value.startsWith(`${resolved}:`) || `${resolved}:${hash(await readFile(resolved))}` !== value) {
+					matching = false;
+				}
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code !== "ENOENT" && code !== "ENOTDIR" && code !== "EISDIR") throw error;
+				matching = false;
+			}
+		}
+	}
+	await Promise.all(Array.from({ length: Math.min(inputs.length, 16) }, checkInputs));
+	return matching;
+}
+
+function hash(value: string | Buffer): string {
 	return createHash("sha256").update(value).digest("hex");
 }

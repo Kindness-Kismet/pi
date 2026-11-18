@@ -5,6 +5,7 @@ import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "bun";
+import { injectPackageHooks, replaceOnce } from "./package-hooks.ts";
 
 const root = fileURLToPath(new URL("../../../../", import.meta.url));
 const packageRoot = join(root, "packages/coding-agent");
@@ -14,6 +15,7 @@ const output = join(root, "build/startup-precompile/binaries");
 await mkdir(output, { recursive: true });
 const outfile = join(output, "pi-precompiled.exe");
 const compilerPath = fileURLToPath(new URL("./extension-cache.ts", import.meta.url));
+const installedModule = fileURLToPath(new URL("./installed-extensions.ts", import.meta.url));
 const compilerBuild = await build({
 	entrypoints: [fileURLToPath(new URL("./extension-bundle.ts", import.meta.url))],
 	target: "bun",
@@ -58,10 +60,10 @@ const result = await build({
 				});
 				builder.onLoad({ filter: /[\\/]core[\\/]extensions[\\/]loader\.ts$/ }, async (args) => {
 					let source = await readFile(args.path, "utf8");
-					source = `import { prepareCompiledExtension } from ${JSON.stringify(compilerPath)};\n${source}`;
+					source = `import { prepareCompiledExtension } from ${JSON.stringify(compilerPath)};\nimport { selectedInstallRoot } from ${JSON.stringify(installedModule)};\n${source}`;
 					source = source.replace(
 						"const jiti = createJitiImpl(import.meta.url, {",
-						'const compilerJiti = createJitiImpl(import.meta.url, { moduleCache: false, fsCache: false, ...resolutionOptions });\n\tconst compiled = await prepareCompiledExtension(canonicalizePath(extensionPath), resolutionOptions.virtualModules ?? {}, compilerJiti, path.join(getAgentDir(), "cache", "extensions-prototype"));\n\tconst jiti = createJitiImpl(import.meta.url, {',
+						'const compilerJiti = createJitiImpl(import.meta.url, { moduleCache: false, fsCache: false, ...resolutionOptions });\n\tconst compiled = await prepareCompiledExtension(canonicalizePath(extensionPath), resolutionOptions.virtualModules ?? {}, compilerJiti, path.join(getAgentDir(), "cache", "extensions-prototype"), pathsEqual(canonicalizePath(extensionPath), extensionPath) ? selectedInstallRoot(extensionPath) : undefined);\n\tconst jiti = createJitiImpl(import.meta.url, {',
 					);
 					source = source.replace(
 						"moduleCache: false,\n\t\t...resolutionOptions,",
@@ -79,24 +81,12 @@ const result = await build({
 					}
 					source += `
 /** Precompile installed entries without executing extension factories. */
-export async function precompileInstalledExtensions(paths: Array<string | undefined>): Promise<void> {
-	const pending = paths.filter((filename): filename is string => filename !== undefined);
-	const seen = new Set<string>();
-	const files: string[] = [];
-	while (pending.length) {
-		const filename = canonicalizePath(pending.pop()!);
-		if (seen.has(filename)) continue;
-		seen.add(filename);
-		if (!fs.existsSync(filename)) continue;
-		if (fs.statSync(filename).isDirectory()) {
-			pending.push(...(resolveExtensionEntries(filename) ?? discoverExtensionsInDir(filename)));
-		} else files.push(filename);
-	}
-	if (files.length === 0) return;
+export async function precompileInstalledExtensions(files: Map<string, string | undefined>, cache: string): Promise<void> {
+	if (!files.size) return;
 	const createJitiImpl = await getCreateJiti();
 	const virtualModules = await getVirtualModules();
 	const compiler = createJitiImpl(import.meta.url, { virtualModules, tryNative: false, moduleCache: false, fsCache: false });
-	for (const filename of files) await prepareCompiledExtension(filename, virtualModules, compiler, path.join(getAgentDir(), "cache", "extensions-prototype"));
+	for (const [filename, root] of files) await prepareCompiledExtension(canonicalizePath(filename), virtualModules, compiler, cache, root);
 }
 `;
 					return {
@@ -105,31 +95,28 @@ export async function precompileInstalledExtensions(paths: Array<string | undefi
 						resolveDir: dirname(args.path),
 					};
 				});
-				builder.onLoad({ filter: /[\\/]core[\\/]package-manager\.ts$/ }, async (args) => {
+				builder.onLoad({ filter: /[\\/]core[\\/]resource-loader\.ts$/ }, async (args) => {
 					let source = await readFile(args.path, "utf8");
-					source = `import { precompileInstalledExtensions } from "./extensions/loader.ts";\n${source}`;
-					const installEnd =
-						// biome-ignore lint/suspicious/noTemplateCurlyInString: Match the source's literal placeholder.
-						"\t\t\tthrow new Error(`Unsupported install source: ${source}`);\n\t\t});\n\t}";
-					if (!source.includes(installEnd)) throw new Error("Package installer structure changed");
-					source = source.replace(
-						installEnd,
-						// biome-ignore lint/suspicious/noTemplateCurlyInString: Preserve the source's literal placeholder.
-						"\t\t\tthrow new Error(`Unsupported install source: ${source}`);\n\t\t});\n\t\tawait precompileInstalledExtensions([this.getInstalledPath(source, scope)]);\n\t}",
+					source = `import { withInstalledExtensions } from ${JSON.stringify(installedModule)};\n${source}`;
+					const bootstrap = "await loadExtensionsCached(extensionPaths, this.cwd, this.eventBus)";
+					source = replaceOnce(
+						source,
+						bootstrap,
+						"await withInstalledExtensions(metadataByPath, () => loadExtensionsCached(extensionPaths, this.cwd, this.eventBus))",
 					);
-					const updateEnd = "\t\tawait this.updateConfiguredSources(updateSources);";
-					if (!source.includes(updateEnd)) throw new Error("Package updater structure changed");
-					source = source.replace(
-						updateEnd,
-						updateEnd +
-							"\n\t\tawait precompileInstalledExtensions(updateSources.map(entry => this.getInstalledPath(entry.source, entry.scope)));",
+					const finalLoad = "await this.loadFinalExtensionSet(extensionPaths, preTrustExtensions)";
+					source = replaceOnce(
+						source,
+						finalLoad,
+						"await withInstalledExtensions(metadataByPath, () => this.loadFinalExtensionSet(extensionPaths, preTrustExtensions))",
 					);
-					return {
-						contents: source,
-						loader: "ts",
-						resolveDir: dirname(args.path),
-					};
+					return { contents: source, loader: "ts", resolveDir: dirname(args.path) };
 				});
+				builder.onLoad({ filter: /[\\/]core[\\/]package-manager\.ts$/ }, async (args) => ({
+					contents: injectPackageHooks(await readFile(args.path, "utf8"), installedModule),
+					loader: "ts",
+					resolveDir: dirname(args.path),
+				}));
 			},
 		},
 	],
