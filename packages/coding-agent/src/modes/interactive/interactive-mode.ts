@@ -2525,7 +2525,10 @@ export class InteractiveMode {
 	}
 
 	private setHiddenThinkingLabel(label?: string): void {
-		this.hiddenThinkingLabel = label ?? this.defaultHiddenThinkingLabel;
+		const nextLabel = label ?? this.defaultHiddenThinkingLabel;
+		// Repeating the global setting must preserve per-message labels already in scrollback.
+		if (nextLabel === this.hiddenThinkingLabel) return;
+		this.hiddenThinkingLabel = nextLabel;
 		for (const child of this.chatContainer.children) {
 			if (child instanceof AssistantMessageComponent) {
 				child.setHiddenThinkingLabel(this.hiddenThinkingLabel);

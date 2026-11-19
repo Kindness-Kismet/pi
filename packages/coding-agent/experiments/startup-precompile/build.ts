@@ -31,6 +31,7 @@ const result = await build({
 	],
 	root: packageRoot,
 	target: "bun",
+	define: { "process.env.PI_TUI_DEBUG_SCROLL": JSON.stringify("1") },
 	compile: {
 		target: "bun-windows-x64-baseline",
 		outfile,

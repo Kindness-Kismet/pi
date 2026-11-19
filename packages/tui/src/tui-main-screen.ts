@@ -1,6 +1,9 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { parseKey } from "./keys.ts";
+import { RenderTrace } from "./render-trace.ts";
 import { ScrollbackLayout } from "./scrollback-layout.ts";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
 import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
@@ -139,6 +142,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private hardwareCursorCol: number | undefined;
 	private maxLinesRendered = 0;
 	private previousViewportTop = 0;
+	private renderTrace: RenderTrace | undefined;
+	private traceFrame = 0;
+	private removeTraceInputListener: (() => void) | undefined;
 
 	captureRenderState(): TuiMainScreenRenderState {
 		return {
@@ -153,6 +159,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	restoreRenderState(state: TuiMainScreenRenderState): void {
+		this.renderTrace?.record("restore-render-state", {
+			previousRows: this.previousLines.length,
+			restoredRows: state.previousLines.length,
+			previousViewportTop: this.previousViewportTop,
+			restoredViewportTop: state.previousViewportTop,
+		});
 		this.scrollbackLayout.invalidate();
 		this.previousLines = state.previousLines.map((line) => (isImageLine(line) ? "" : line));
 		this.previousKittyImageIds = new Set();
@@ -166,11 +178,17 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	override invalidate(): void {
+		this.renderTrace?.record("invalidate", { stack: new Error().stack });
 		this.scrollbackLayout.invalidate();
 		super.invalidate();
 	}
 
 	protected override resetRenderState(): void {
+		this.renderTrace?.record("reset-render-state", {
+			rows: this.previousLines.length,
+			viewportTop: this.previousViewportTop,
+			stack: new Error().stack,
+		});
 		this.scrollbackLayout.invalidate();
 		this.previousLines = [];
 		this.previousWidth = -1;
@@ -184,6 +202,25 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 	protected override afterTerminalStart(): void {
 		this.hardwareCursorCol = undefined;
+		if (process.env.PI_TUI_DEBUG_SCROLL === "1" && this.logDirectory) {
+			this.renderTrace = new RenderTrace(this.logDirectory);
+			this.removeTraceInputListener = this.addInputListener((data) => {
+				const key = parseKey(data);
+				if (key && key.length > 1 && key !== "space") {
+					this.renderTrace?.record("input-key", { key });
+				} else if (/^\x1b\[<\d+;\d+;\d+[Mm]$/.test(data)) {
+					this.renderTrace?.record("input-mouse", { sequence: data });
+				}
+			});
+		}
+	}
+
+	protected override afterTerminalStop(): void {
+		this.renderTrace?.record("trace-stop", {});
+		this.removeTraceInputListener?.();
+		this.removeTraceInputListener = undefined;
+		this.renderTrace?.close();
+		this.renderTrace = undefined;
 	}
 
 	protected override getExitRestorePrefix(): string {
@@ -272,6 +309,17 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 	protected doRender(): void {
 		if (this.stopped) return;
+		const traceStarted = performance.now();
+		const traceFrame = this.renderTrace ? ++this.traceFrame : undefined;
+		const traceBefore = this.renderTrace
+			? {
+					previousRows: this.previousLines.length,
+					previousWidth: this.previousWidth,
+					previousHeight: this.previousHeight,
+					previousViewportTop: this.previousViewportTop,
+					previousCursorRow: this.hardwareCursorRow,
+				}
+			: undefined;
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
 		const widthChanged = this.previousWidth !== 0 && this.previousWidth !== width;
@@ -302,6 +350,27 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const cursorPos = this.extractCursorPosition(newLines, height);
 
 		newLines = this.applyLineResets(newLines);
+		let firstChanged = -1;
+		let lastChanged = -1;
+		let redrawReason = "";
+		const recordFrame = (event: string, details: Record<string, unknown>): void => {
+			if (!this.renderTrace) return;
+			this.renderTrace.record(event, {
+				frame: traceFrame,
+				...traceBefore,
+				width,
+				height,
+				newRows: newLines.length,
+				viewportTop: this.previousViewportTop,
+				cursorRow: this.hardwareCursorRow,
+				cursorPos,
+				firstChanged,
+				lastChanged,
+				overlays: this.hasOverlayEntries,
+				durationMs: performance.now() - traceStarted,
+				...details,
+			});
+		};
 
 		// Helper to clear scrollback and viewport and render all new lines
 		const fullRender = (clear: boolean): void => {
@@ -347,10 +416,24 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 			this.previousWidth = width;
 			this.previousHeight = height;
+			recordFrame("full-render", { reason: redrawReason, clear, writtenChars: output.length });
 		};
 
 		const redrawLogDirectory = process.env.PI_TUI_DEBUG_REDRAW === "1" ? this.logDirectory : undefined;
 		const logRedraw = (reason: string): void => {
+			redrawReason = reason;
+			if (this.renderTrace && firstChanged >= 0) {
+				this.renderTrace.record("changed-line", {
+					frame: traceFrame,
+					row: firstChanged,
+					previousHash: createHash("sha256")
+						.update(this.previousLines[firstChanged] ?? "")
+						.digest("hex"),
+					newHash: createHash("sha256")
+						.update(newLines[firstChanged] ?? "")
+						.digest("hex"),
+				});
+			}
 			if (redrawLogDirectory === undefined) return;
 			const logPath = path.join(redrawLogDirectory, "pi-tui-debug.log");
 			const msg = `[${new Date().toISOString()}] fullRender: ${reason} (prev=${this.previousLines.length}, new=${newLines.length}, height=${height})\n`;
@@ -391,8 +474,6 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		}
 
 		// Find first and last changed lines
-		let firstChanged = -1;
-		let lastChanged = -1;
 		const maxLines = Math.max(newLines.length, this.previousLines.length);
 		for (let i = 0; i < maxLines; i++) {
 			const oldLine = i < this.previousLines.length ? this.previousLines[i] : "";
@@ -425,6 +506,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			if (cursorSequence) this.terminal.write(`\x1b[?2026h${cursorSequence}\x1b[?2026l`);
 			this.previousViewportTop = prevViewportTop;
 			this.previousHeight = height;
+			if (cursorSequence) recordFrame("cursor-only", { writtenChars: cursorSequence.length });
 			return;
 		}
 
@@ -476,6 +558,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			this.previousWidth = width;
 			this.previousHeight = height;
 			this.previousViewportTop = prevViewportTop;
+			recordFrame("delete-lines", { removedRows: traceBefore ? traceBefore.previousRows - newLines.length : 0 });
 			return;
 		}
 
@@ -657,6 +740,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 		this.previousWidth = width;
 		this.previousHeight = height;
+		recordFrame("differential-render", { renderEnd, finalCursorRow, lineDiff, writtenChars: output.length });
 	}
 
 	// Cursor placement and visibility must share the content's synchronized write.
@@ -671,6 +755,15 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 		// Move cursor from current position to target
 		const rowDelta = targetRow - this.hardwareCursorRow;
+		if (rowDelta !== 0) {
+			this.renderTrace?.record("cursor-move", {
+				frame: this.traceFrame,
+				fromRow: this.hardwareCursorRow,
+				toRow: targetRow,
+				rowDelta,
+				col: targetCol,
+			});
+		}
 		let buffer = "";
 		if (rowDelta > 0) {
 			buffer += `\x1b[${rowDelta}B`; // Move down
